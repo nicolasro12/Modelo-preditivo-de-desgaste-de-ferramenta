@@ -30,7 +30,8 @@ O conjunto de dados utilizado neste trabalho foi obtido a partir do estudo:
 > *International Journal of Advanced Manufacturing Technology*, v. 125, p. 4027–4045, 2023.  
 > Disponível em: <https://doi.org/10.1007/s00170-023-10811-9>.  
 > Acesso em: 2 ago. 2025.
-
+> **Repositório dos dados:** VICOMTECH. *dataset_machine_tool_wear.* GitHub, 2023.
+> Disponível em: <https://github.com/Vicomtech/dataset-machine-tool-wear>.  
 Este dataset apresenta medições de desgaste de ferramentas (Vb) e variáveis de força de corte, coletadas experimentalmente em diferentes condições de operação.
 
 ---
