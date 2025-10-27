@@ -1,0 +1,260 @@
+import pandas as pd
+import numpy as np
+import time
+import matplotlib.pyplot as plt
+
+from sklearn.base import clone
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split, RandomizedSearchCV, KFold
+from sklearn.metrics import r2_score, mean_squared_error
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.neighbors import KNeighborsRegressor
+from scipy.stats import randint, uniform
+
+# ======================================================================
+# Configurações gerais
+# ======================================================================
+UNLABELED_LABEL = -1.0
+RANDOM_STATE = 42
+N_ITER_SEARCH = 15
+CV_SPLITS = 5
+
+# Função auxiliar para calcular RMSE
+def calculate_rmse(y_true, y_pred):
+    return np.sqrt(mean_squared_error(y_true, y_pred))
+
+# ======================================================================
+# 1. CARREGAR E PREPARAR OS DADOS
+# ======================================================================
+print("--- 1/5: Carregando e Preparando os Dados ---")
+try:
+    df = pd.read_csv("Dataset_Machine_tool_wear.csv")
+except FileNotFoundError:
+    print("Erro: O arquivo 'Dataset_Machine_tool_wear.csv' não foi encontrado.")
+    raise SystemExit(1)
+
+features = ['F_f_RMS', 'F_f_MEAN', 'F_f_MAX']
+target = 'Vb'
+
+df_clean = df[features + [target]].dropna()
+y_true = df_clean[target].astype(float).values
+X = df_clean[features].astype(float).values
+
+# IMPORTANTE: o scaler agora fica dentro do Pipeline (para CV correta)
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y_true, test_size=0.2, random_state=RANDOM_STATE
+)
+n_train = len(y_train)
+
+# ======================================================================
+# 2. OTIMIZAÇÃO COM VALIDAÇÃO CRUZADA (K-Fold) DOS HIPERPARÂMETROS
+# ======================================================================
+print("\n--- 2/5: Otimizando Hiperparâmetros com Cross-Validation ---")
+start_time = time.time()
+
+# Amostra para acelerar a busca (ajuste/retire se quiser usar tudo)
+sample_size = min(n_train, 2000)
+opt_indices = np.random.choice(n_train, size=sample_size, replace=False)
+X_train_opt = X_train[opt_indices]
+y_train_opt = y_train[opt_indices]
+print(f"Otimizando modelos usando uma amostra de {sample_size} pontos de dados...")
+
+# Pipelines para evitar vazamento durante a CV
+pipelines_to_optimize = {
+    'RandomForest': Pipeline([
+        ('scaler', StandardScaler()),
+        ('model', RandomForestRegressor(random_state=RANDOM_STATE, n_jobs=-1))
+    ]),
+    'GradientBoosting': Pipeline([
+        ('scaler', StandardScaler()),
+        ('model', GradientBoostingRegressor(random_state=RANDOM_STATE))
+    ]),
+    'KNN': Pipeline([
+        ('scaler', StandardScaler()),
+        ('model', KNeighborsRegressor(n_jobs=-1))
+    ]),
+}
+
+# Espaços de busca (note o prefixo "model__")
+param_distributions = {
+    'RandomForest': {
+        'model__n_estimators': randint(100, 300),
+        'model__max_depth': [10, 20, None],
+        'model__min_samples_leaf': randint(1, 4)
+    },
+    'GradientBoosting': {
+        'model__n_estimators': randint(100, 300),
+        'model__learning_rate': uniform(0.05, 0.25-0.05),  # ~[0.05, 0.25)
+        'model__max_depth': randint(3, 8)
+    },
+    'KNN': {
+        'model__n_neighbors': randint(3, 15),
+        'model__weights': ['uniform', 'distance'],
+        'model__p': [1, 2]  # Manhattan vs Euclidiana
+    },
+}
+
+cv = KFold(n_splits=CV_SPLITS, shuffle=True, random_state=RANDOM_STATE)
+
+optimized_estimators = {}
+for name, pipe in pipelines_to_optimize.items():
+    print(f"Otimizando {name} com {CV_SPLITS}-Fold CV...")
+    random_search = RandomizedSearchCV(
+        estimator=pipe,
+        param_distributions=param_distributions[name],
+        n_iter=N_ITER_SEARCH,
+        scoring='r2',
+        cv=cv,
+        n_jobs=-1,
+        random_state=RANDOM_STATE,
+        refit=True,              # mantém o melhor já treinado
+        verbose=0,
+        return_train_score=False
+    )
+    random_search.fit(X_train_opt, y_train_opt)
+    optimized_estimators[name] = random_search.best_estimator_
+    print(f"Melhores parâmetros para {name}: {random_search.best_params_}")
+    print(f"Melhor R² (CV média): {random_search.best_score_:.4f}\n")
+
+print(f"Otimização (com CV) concluída em {time.time() - start_time:.2f} s.")
+
+# ======================================================================
+# 3. LOOP DE COMPARAÇÃO COM MODELOS OTIMIZADOS (pseudo-rotulagem simples)
+# ======================================================================
+print("\n--- 3/5: Rodando Simulação com Porcentagens de Rótulos ---")
+model_teto = optimized_estimators['RandomForest']
+# Reajuste no conjunto completo de treino rotulado (treino inteiro)
+model_teto_full = clone(model_teto).fit(X_train, y_train)
+r2_teto = model_teto_full.score(X_test, y_test)
+rmse_teto = calculate_rmse(y_test, model_teto_full.predict(X_test))
+print(f"\nTeto de Desempenho (RF Supervisionado Otimizado): R²={r2_teto:.4f}, RMSE={rmse_teto:.4f}")
+
+optimized_models_ssl = {
+    'RF (Self-Training)': optimized_estimators['RandomForest'],
+    'GBR (Self-Training)': optimized_estimators['GradientBoosting'],
+    'KNN (Self-Training)': optimized_estimators['KNN'],
+}
+
+label_percentages = [0.01, 0.05, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.00]
+results_curves = {name: {'R2': [], 'RMSE': []} for name in optimized_models_ssl}
+results_curves['Teto (RF Supervisionado)'] = {
+    'R2': [r2_teto] * len(label_percentages),
+    'RMSE': [rmse_teto] * len(label_percentages)
+}
+
+for percentage in label_percentages:
+    n_labeled = int(n_train * percentage)
+
+    y_masked_simulated = np.full(n_train, UNLABELED_LABEL, dtype=float)
+    if n_labeled > 0:
+        labeled_indices = np.random.choice(n_train, size=n_labeled, replace=False)
+        y_masked_simulated[labeled_indices] = y_train[labeled_indices]
+
+    labeled_mask = y_masked_simulated != UNLABELED_LABEL
+    X_labeled_iter, y_labeled_iter = X_train[labeled_mask], y_masked_simulated[labeled_mask]
+    X_unlabeled_iter = X_train[~labeled_mask]
+
+    for name, best_pipe in optimized_models_ssl.items():
+        model_instance = clone(best_pipe)
+
+        # KNN requer pelo menos n_neighbors rotulados
+        if name == 'KNN (Self-Training)':
+            # recupera n_neighbors do pipeline clonado
+            n_neighbors = model_instance.get_params().get('model__n_neighbors', 5)
+            if len(y_labeled_iter) < n_neighbors:
+                results_curves[name]['R2'].append(np.nan)
+                results_curves[name]['RMSE'].append(np.nan)
+                continue
+
+        if len(y_labeled_iter) == 0:
+            results_curves[name]['R2'].append(np.nan)
+            results_curves[name]['RMSE'].append(np.nan)
+            continue
+
+        # Treina com o rotulado
+        model_instance.fit(X_labeled_iter, y_labeled_iter)
+
+        # Gera pseudo-rótulos e refaz o ajuste
+        if len(X_unlabeled_iter) > 0:
+            pseudo_labels = model_instance.predict(X_unlabeled_iter)
+            X_train_ssl = np.vstack((X_labeled_iter, X_unlabeled_iter))
+            y_train_ssl = np.concatenate((y_labeled_iter, pseudo_labels))
+            model_instance.fit(X_train_ssl, y_train_ssl)
+
+        y_pred = model_instance.predict(X_test)
+        results_curves[name]['R2'].append(r2_score(y_test, y_pred))
+        results_curves[name]['RMSE'].append(calculate_rmse(y_test, y_pred))
+
+    print(f"Loop {percentage*100:05.1f}% concluído.")
+
+# ======================================================================
+# 4. GERAÇÃO DA TABELA DE RESULTADOS
+# ======================================================================
+print("\n--- 4/5: Gerando Tabela de Resultados ---")
+table_data = {}
+for model_name, metrics in results_curves.items():
+    table_data[f'{model_name} R²'] = metrics['R2']
+    table_data[f'{model_name} RMSE'] = metrics['RMSE']
+
+df_results = pd.DataFrame(table_data)
+df_results.index = [f'{p*100:.0f}%' for p in label_percentages]
+df_results.index.name = 'Rótulos (%)'
+
+pd.set_option('display.float_format', '{:.4f}'.format)
+print("\n" + "="*80)
+print("Tabela Comparativa de Desempenho (com modelos otimizados via K-Fold CV)")
+print("="*80)
+print(df_results)
+print("="*80 + "\n")
+
+# ======================================================================
+# 5. GRÁFICOS COMPARATIVOS
+# ======================================================================
+print("--- 5/5: Gerando Gráficos Comparativos ---")
+plot_percentages = [p * 100 for p in label_percentages]
+colors = {
+    'RF (Self-Training)': 'blue',
+    'GBR (Self-Training)': 'orange',
+    'KNN (Self-Training)': 'purple',
+    'Teto (RF Supervisionado)': 'black'
+}
+
+plt.style.use('seaborn-v0_8-whitegrid')
+
+# Gráfico de R²
+fig, ax1 = plt.subplots(figsize=(14, 7))
+for name, res in results_curves.items():
+    valid_indices = ~np.isnan(res['R2'])
+    x_plot = np.array(plot_percentages)[valid_indices]
+    y_plot = np.array(res['R2'])[valid_indices]
+    linestyle, marker, linewidth = ('--', 's', 2.5) if 'Teto' in name else ('-', 'o', 2)
+    ax1.plot(x_plot, y_plot, marker=marker, linestyle=linestyle,
+             label=name, color=colors[name], linewidth=linewidth)
+
+ax1.set_title('R² vs. Porcentagem de Amostras Rotuladas (Vb)', fontsize=16, weight='bold')
+ax1.set_xlabel('Porcentagem de Medições de Desgaste (Vb) Disponíveis no Treinamento (%)', fontsize=12)
+ax1.set_ylabel('Coeficiente de Determinação (R²)', fontsize=12)
+ax1.legend(fontsize=11)
+ax1.grid(True, which='both', linestyle='--', linewidth=0.5)
+ax1.set_ylim(bottom=min(0, ax1.get_ylim()[0]))
+plt.tight_layout()
+plt.show()
+
+# Gráfico de RMSE
+fig, ax2 = plt.subplots(figsize=(14, 7))
+for name, res in results_curves.items():
+    valid_indices = ~np.isnan(res['RMSE'])
+    x_plot = np.array(plot_percentages)[valid_indices]
+    y_plot = np.array(res['RMSE'])[valid_indices]
+    linestyle, marker, linewidth = ('--', 's', 2.5) if 'Teto' in name else ('-', 'o', 2)
+    ax2.plot(x_plot, y_plot, marker=marker, linestyle=linestyle,
+             label=name, color=colors[name], linewidth=linewidth)
+
+ax2.set_title('RMSE vs. Porcentagem de Amostras Rotuladas (Vb)', fontsize=16, weight='bold')
+ax2.set_xlabel('Porcentagem de Medições de Desgaste (Vb) Disponíveis no Treinamento (%)', fontsize=12)
+ax2.set_ylabel('Raiz do Erro Quadrático Médio (RMSE)', fontsize=12)
+ax2.legend(fontsize=11)
+ax2.grid(True, which='both', linestyle='--', linewidth=0.5)
+plt.tight_layout()
+plt.show()
