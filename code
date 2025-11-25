@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 import time
 import matplotlib.pyplot as plt
+from numpy.random import default_rng  # Importa o gerador de números aleatórios moderno
 
 from sklearn.base import clone
 from sklearn.pipeline import Pipeline
@@ -16,18 +17,19 @@ from scipy.stats import randint, uniform
 # Configurações gerais
 # ======================================================================
 UNLABELED_LABEL = -1.0
-RANDOM_STATE = 42
-N_ITER_SEARCH = 15
-CV_SPLITS = 5
+BASE_RANDOM_STATE = 42
+N_ITER_SEARCH = 15  # Número de iterações para RandomizedSearchCV
+CV_SPLITS = 5       # Número de folds para Cross-Validation
+N_RUNS = 10         # Número de execuções completas da simulação
+N_HYPERPARAM_RUNS = 10 # Número de execuções para otimização de hiperparâmetros
 
 # Função auxiliar para calcular RMSE
 def calculate_rmse(y_true, y_pred):
     return np.sqrt(mean_squared_error(y_true, y_pred))
-
 # ======================================================================
-# 1. CARREGAR E PREPARAR OS DADOS
+# 1. CARREGAR OS DADOS (Feito uma vez)
 # ======================================================================
-print("--- 1/5: Carregando e Preparando os Dados ---")
+print("--- 1/6: Carregando e Preparando os Dados (Uma Vez) ---")
 try:
     df = pd.read_csv("Dataset_Machine_tool_wear.csv")
 except FileNotFoundError:
@@ -38,37 +40,40 @@ features = ['F_f_RMS', 'F_f_MEAN', 'F_f_MAX']
 target = 'Vb'
 
 df_clean = df[features + [target]].dropna()
-y_true = df_clean[target].astype(float).values
-X = df_clean[features].astype(float).values
-
-# IMPORTANTE: o scaler agora fica dentro do Pipeline (para CV correta)
-X_train, X_test, y_train, y_test = train_test_split(
-    X, y_true, test_size=0.2, random_state=RANDOM_STATE
-)
-n_train = len(y_train)
+y_true_full = df_clean[target].astype(float).values
+X_full = df_clean[features].astype(float).values
 
 # ======================================================================
 # 2. OTIMIZAÇÃO COM VALIDAÇÃO CRUZADA (K-Fold) DOS HIPERPARÂMETROS
 # ======================================================================
-print("\n--- 2/5: Otimizando Hiperparâmetros com Cross-Validation ---")
+# Esta etapa agora roda N_HYPERPARAM_RUNS vezes para encontrar os
+# melhores hiperparâmetros de forma mais robusta.
+# ======================================================================
+print(f"\n--- 2/6: Otimizando Hiperparâmetros ({N_HYPERPARAM_RUNS} execuções) ---")
 start_time = time.time()
 
-# Amostra para acelerar a busca (ajuste/retire se quiser usar tudo)
-sample_size = min(n_train, 2000)
-opt_indices = np.random.choice(n_train, size=sample_size, replace=False)
-X_train_opt = X_train[opt_indices]
-y_train_opt = y_train[opt_indices]
+# Divisão de dados *apenas* para a otimização
+X_train_opt, _, y_train_opt, _ = train_test_split(
+    X_full, y_true_full, test_size=0.2, random_state=BASE_RANDOM_STATE
+)
+n_train_opt = len(y_train_opt)
+
+# Amostra para acelerar a busca
+sample_size = min(n_train_opt, 2000)
+opt_indices = np.random.choice(n_train_opt, size=sample_size, replace=False)
+X_train_opt_sample = X_train_opt[opt_indices]
+y_train_opt_sample = y_train_opt[opt_indices]
 print(f"Otimizando modelos usando uma amostra de {sample_size} pontos de dados...")
 
 # Pipelines para evitar vazamento durante a CV
 pipelines_to_optimize = {
     'RandomForest': Pipeline([
         ('scaler', StandardScaler()),
-        ('model', RandomForestRegressor(random_state=RANDOM_STATE, n_jobs=-1))
+        ('model', RandomForestRegressor(random_state=BASE_RANDOM_STATE, n_jobs=-1))
     ]),
     'GradientBoosting': Pipeline([
         ('scaler', StandardScaler()),
-        ('model', GradientBoostingRegressor(random_state=RANDOM_STATE))
+        ('model', GradientBoostingRegressor(random_state=BASE_RANDOM_STATE))
     ]),
     'KNN': Pipeline([
         ('scaler', StandardScaler()),
@@ -76,7 +81,7 @@ pipelines_to_optimize = {
     ]),
 }
 
-# Espaços de busca (note o prefixo "model__")
+# Espaços de busca
 param_distributions = {
     'RandomForest': {
         'model__n_estimators': randint(100, 300),
@@ -85,176 +90,428 @@ param_distributions = {
     },
     'GradientBoosting': {
         'model__n_estimators': randint(100, 300),
-        'model__learning_rate': uniform(0.05, 0.25-0.05),  # ~[0.05, 0.25)
+        'model__learning_rate': uniform(0.05, 0.25 - 0.05),
         'model__max_depth': randint(3, 8)
     },
     'KNN': {
         'model__n_neighbors': randint(3, 15),
         'model__weights': ['uniform', 'distance'],
-        'model__p': [1, 2]  # Manhattan vs Euclidiana
+        'model__p': [1, 2]
     },
 }
 
-cv = KFold(n_splits=CV_SPLITS, shuffle=True, random_state=RANDOM_STATE)
+# Estruturas para armazenar os "campeões" de todas as N_HYPERPARAM_RUNS
+best_overall_estimators = {}
+best_overall_hyperparams = {}
+best_overall_scores = {name: -np.inf for name in pipelines_to_optimize}
 
-optimized_estimators = {}
-for name, pipe in pipelines_to_optimize.items():
-    print(f"Otimizando {name} com {CV_SPLITS}-Fold CV...")
-    random_search = RandomizedSearchCV(
-        estimator=pipe,
-        param_distributions=param_distributions[name],
-        n_iter=N_ITER_SEARCH,
-        scoring='r2',
-        cv=cv,
-        n_jobs=-1,
-        random_state=RANDOM_STATE,
-        refit=True,              # mantém o melhor já treinado
-        verbose=0,
-        return_train_score=False
+for i in range(N_HYPERPARAM_RUNS):
+    CURRENT_SEARCH_STATE = BASE_RANDOM_STATE + i
+    print(f"\n--- Início Otimização Hiperparâmetros Run {i + 1}/{N_HYPERPARAM_RUNS} (State: {CURRENT_SEARCH_STATE}) ---")
+
+    for name, pipe in pipelines_to_optimize.items():
+        # Novo KFold com random_state diferente para cada run
+        cv = KFold(n_splits=CV_SPLITS, shuffle=True, random_state=CURRENT_SEARCH_STATE)
+
+        random_search = RandomizedSearchCV(
+            estimator=pipe,
+            param_distributions=param_distributions[name],
+            n_iter=N_ITER_SEARCH,
+            scoring='r2',
+            cv=cv,
+            n_jobs=-1,
+            random_state=CURRENT_SEARCH_STATE,
+            refit=True, # Refaz o fit no X_train_opt_sample
+            verbose=0,
+        )
+        random_search.fit(X_train_opt_sample, y_train_opt_sample)
+        current_best_score = random_search.best_score_
+
+        print(f"  {name} (Run {i+1}): R² CV={current_best_score:.4f}")
+
+        # Verifica se este é o melhor resultado encontrado até agora para este modelo
+        if current_best_score > best_overall_scores[name]:
+            best_overall_scores[name] = current_best_score
+            best_overall_estimators[name] = random_search.best_estimator_
+            best_overall_hyperparams[name] = random_search.best_params_
+            print(f"    *** Novo melhor para {name}! R²={current_best_score:.4f} (Params: {random_search.best_params_}) ***")
+
+print(f"\nOtimização (com {N_HYPERPARAM_RUNS} runs) concluída em {time.time() - start_time:.2f} s.")
+
+# --- INÍCIO DA SEÇÃO DE RELATÓRIO DE HIPERPARÂMETROS ---
+print("\n" + "="*80)
+print("RELATÓRIO: Melhores Hiperparâmetros Encontrados (Usados em todas as simulações)")
+print("="*80)
+for name, params in best_overall_hyperparams.items():
+    print(f"\nModelo: {name} (Melhor R² CV: {best_overall_scores[name]:.4f})")
+    for param, value in params.items():
+        print(f"  - {param}: {value}")
+print("="*80 + "\n")
+# --- FIM DA SEÇÃO DE RELATÓRIO DE HIPERPARÂMETROS ---
+
+# ======================================================================
+# 3. LOOP DE SIMULAÇÃO (N_RUNS)
+# ======================================================================
+print(f"\n--- 3/6: Iniciando {N_RUNS} Simulações (Loop Principal) ---")
+
+all_run_results = []
+last_run_predictions = {}
+last_run_y_test = None
+
+for run_i in range(N_RUNS):
+    CURRENT_RANDOM_STATE = BASE_RANDOM_STATE + run_i
+    rng = default_rng(CURRENT_RANDOM_STATE) # Gerador de números aleatórios para esta run
+
+    print(f"\n--- Iniciando Execução {run_i + 1}/{N_RUNS} (Random State: {CURRENT_RANDOM_STATE}) ---")
+
+    # 3.1. Divisão de dados para esta simulação
+    X_train, X_test, y_train, y_test = train_test_split(
+        X_full, y_true_full, test_size=0.2, random_state=CURRENT_RANDOM_STATE
     )
-    random_search.fit(X_train_opt, y_train_opt)
-    optimized_estimators[name] = random_search.best_estimator_
-    print(f"Melhores parâmetros para {name}: {random_search.best_params_}")
-    print(f"Melhor R² (CV média): {random_search.best_score_:.4f}\n")
+    n_train = len(y_train)
 
-print(f"Otimização (com CV) concluída em {time.time() - start_time:.2f} s.")
+    if run_i == N_RUNS - 1:
+        last_run_y_test = y_test
+        last_run_predictions['RF (Self-Training)'] = {}
+        last_run_predictions['GBR (Self-Training)'] = {}
+        last_run_predictions['KNN (Self-Training)'] = {}
 
-# ======================================================================
-# 3. LOOP DE COMPARAÇÃO COM MODELOS OTIMIZADOS (pseudo-rotulagem simples)
-# ======================================================================
-print("\n--- 3/5: Rodando Simulação com Porcentagens de Rótulos ---")
-model_teto = optimized_estimators['RandomForest']
-# Reajuste no conjunto completo de treino rotulado (treino inteiro)
-model_teto_full = clone(model_teto).fit(X_train, y_train)
-r2_teto = model_teto_full.score(X_test, y_test)
-rmse_teto = calculate_rmse(y_test, model_teto_full.predict(X_test))
-print(f"\nTeto de Desempenho (RF Supervisionado Otimizado): R²={r2_teto:.4f}, RMSE={rmse_teto:.4f}")
+    # 3.2. Configuração do Teto (Supervisionado) para esta simulação
+    # O modelo KNN é escolhido como Teto, pois obteve o melhor R² na otimização (0.9177)
+    TETO_MODEL_NAME = 'Teto (KNN Supervisionado)'
+    model_teto_base = best_overall_estimators['KNN']
+    model_teto_full = clone(model_teto_base).fit(X_train, y_train)
 
-optimized_models_ssl = {
-    'RF (Self-Training)': optimized_estimators['RandomForest'],
-    'GBR (Self-Training)': optimized_estimators['GradientBoosting'],
-    'KNN (Self-Training)': optimized_estimators['KNN'],
-}
+    y_pred_teto = model_teto_full.predict(X_test)
+    r2_teto = r2_score(y_test, y_pred_teto)
+    rmse_teto = calculate_rmse(y_test, y_pred_teto)
 
-label_percentages = [0.01, 0.05, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.00]
-results_curves = {name: {'R2': [], 'RMSE': []} for name in optimized_models_ssl}
-results_curves['Teto (RF Supervisionado)'] = {
-    'R2': [r2_teto] * len(label_percentages),
-    'RMSE': [rmse_teto] * len(label_percentages)
-}
+    if run_i == N_RUNS - 1:
+        last_run_predictions[TETO_MODEL_NAME] = y_pred_teto
+        # --- CORREÇÃO: Salva o RMSE do Teto explicitamente para a plotagem ---
+        last_run_predictions['RMSE_Teto_Ref'] = rmse_teto
 
-for percentage in label_percentages:
-    n_labeled = int(n_train * percentage)
 
-    y_masked_simulated = np.full(n_train, UNLABELED_LABEL, dtype=float)
-    if n_labeled > 0:
-        labeled_indices = np.random.choice(n_train, size=n_labeled, replace=False)
-        y_masked_simulated[labeled_indices] = y_train[labeled_indices]
+    # 3.3. Configuração dos modelos SSL
+    # Usamos os *melhores* estimadores da Etapa 2
+    optimized_models_ssl = {
+        'RF (Self-Training)': best_overall_estimators['RandomForest'],
+        'GBR (Self-Training)': best_overall_estimators['GradientBoosting'],
+        'KNN (Self-Training)': best_overall_estimators['KNN'],
+    }
 
-    labeled_mask = y_masked_simulated != UNLABELED_LABEL
-    X_labeled_iter, y_labeled_iter = X_train[labeled_mask], y_masked_simulated[labeled_mask]
-    X_unlabeled_iter = X_train[~labeled_mask]
+    label_percentages = [0.01, 0.05, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.00]
+    results_curves = {name: {'R2': [], 'RMSE': []} for name in optimized_models_ssl}
+    results_curves['Teto (KNN Supervisionado)'] = {
+        'R2': [r2_teto] * len(label_percentages),
+        'RMSE': [rmse_teto] * len(label_percentages)
+    }
 
-    for name, best_pipe in optimized_models_ssl.items():
-        model_instance = clone(best_pipe)
+    # 3.4. Loop de porcentagens de rótulos
+    for percentage in label_percentages:
+        n_labeled = int(n_train * percentage)
 
-        # KNN requer pelo menos n_neighbors rotulados
-        if name == 'KNN (Self-Training)':
-            # recupera n_neighbors do pipeline clonado
-            n_neighbors = model_instance.get_params().get('model__n_neighbors', 5)
-            if len(y_labeled_iter) < n_neighbors:
+        y_masked_simulated = np.full(n_train, UNLABELED_LABEL, dtype=float)
+        if n_labeled > 0:
+            labeled_indices = rng.choice(n_train, size=n_labeled, replace=False)
+            y_masked_simulated[labeled_indices] = y_train[labeled_indices]
+
+        labeled_mask = y_masked_simulated != UNLABELED_LABEL
+        X_labeled_iter, y_labeled_iter = X_train[labeled_mask], y_masked_simulated[labeled_mask]
+        X_unlabeled_iter = X_train[~labeled_mask]
+
+        for name, best_pipe in optimized_models_ssl.items():
+            model_instance = clone(best_pipe)
+
+            # Validação para KNN
+            if name == 'KNN (Self-Training)':
+                n_neighbors = model_instance.get_params().get('model__n_neighbors', 5)
+                if len(y_labeled_iter) < n_neighbors:
+                    results_curves[name]['R2'].append(np.nan)
+                    results_curves[name]['RMSE'].append(np.nan)
+                    # Salva np.nan na última execução para o gráfico de dispersão
+                    if run_i == N_RUNS - 1:
+                        last_run_predictions[name][percentage] = np.nan
+                    continue
+
+            if len(y_labeled_iter) == 0:
                 results_curves[name]['R2'].append(np.nan)
                 results_curves[name]['RMSE'].append(np.nan)
+                if run_i == N_RUNS - 1:
+                    last_run_predictions[name][percentage] = np.nan
                 continue
 
-        if len(y_labeled_iter) == 0:
-            results_curves[name]['R2'].append(np.nan)
-            results_curves[name]['RMSE'].append(np.nan)
-            continue
+            # Treina com o rotulado
+            model_instance.fit(X_labeled_iter, y_labeled_iter)
 
-        # Treina com o rotulado
-        model_instance.fit(X_labeled_iter, y_labeled_iter)
+            # Gera pseudo-rótulos e refaz o ajuste
+            if len(X_unlabeled_iter) > 0:
+                pseudo_labels = model_instance.predict(X_unlabeled_iter)
+                X_train_ssl = np.vstack((X_labeled_iter, X_unlabeled_iter))
+                y_train_ssl = np.concatenate((y_labeled_iter, pseudo_labels))
+                model_instance.fit(X_train_ssl, y_train_ssl)
 
-        # Gera pseudo-rótulos e refaz o ajuste
-        if len(X_unlabeled_iter) > 0:
-            pseudo_labels = model_instance.predict(X_unlabeled_iter)
-            X_train_ssl = np.vstack((X_labeled_iter, X_unlabeled_iter))
-            y_train_ssl = np.concatenate((y_labeled_iter, pseudo_labels))
-            model_instance.fit(X_train_ssl, y_train_ssl)
+            y_pred = model_instance.predict(X_test)
+            results_curves[name]['R2'].append(r2_score(y_test, y_pred))
+            results_curves[name]['RMSE'].append(calculate_rmse(y_test, y_pred))
 
-        y_pred = model_instance.predict(X_test)
-        results_curves[name]['R2'].append(r2_score(y_test, y_pred))
-        results_curves[name]['RMSE'].append(calculate_rmse(y_test, y_pred))
+            # Salva predições da última execução para os gráficos de dispersão
+            if run_i == N_RUNS - 1:
+                last_run_predictions[name][percentage] = y_pred
 
-    print(f"Loop {percentage*100:05.1f}% concluído.")
+    print(f"Execução {run_i + 1}/{N_RUNS} concluída.")
 
+    # 3.5. Coleta de resultados da execução atual
+    table_data = {}
+    for model_name, metrics in results_curves.items():
+        table_data[f'{model_name} R²'] = metrics['R2']
+        table_data[f'{model_name} RMSE'] = metrics['RMSE']
+
+    df_results = pd.DataFrame(table_data)
+    df_results.index = [f'{p*100:.0f}%' for p in label_percentages]
+    df_results.index.name = 'Rótulos (%)'
+    all_run_results.append(df_results)
 # ======================================================================
-# 4. GERAÇÃO DA TABELA DE RESULTADOS
+# 4. GERAÇÃO DA TABELA DE MÉDIA
 # ======================================================================
-print("\n--- 4/5: Gerando Tabela de Resultados ---")
-table_data = {}
-for model_name, metrics in results_curves.items():
-    table_data[f'{model_name} R²'] = metrics['R2']
-    table_data[f'{model_name} RMSE'] = metrics['RMSE']
+print("\n--- 4/6: Gerando Tabelas de Média ---")
 
-df_results = pd.DataFrame(table_data)
-df_results.index = [f'{p*100:.0f}%' for p in label_percentages]
-df_results.index.name = 'Rótulos (%)'
+# Concatena todos os DataFrames de resultados
+df_stacked = pd.concat(all_run_results)
+
+# Agrupa pelo índice (Rótulos %) e calcula a média
+df_mean = df_stacked.groupby(df_stacked.index).mean()
+# Reordena o índice para ficar de 1% a 100%
+df_mean = df_mean.reindex([f'{p*100:.0f}%' for p in label_percentages])
+
 
 pd.set_option('display.float_format', '{:.4f}'.format)
+pd.set_option('display.width', 150) # Ajusta a largura para melhor visualização
+
 print("\n" + "="*80)
-print("Tabela Comparativa de Desempenho (com modelos otimizados via K-Fold CV)")
+print(f"Tabela de MÉDIA de Desempenho (baseado em {N_RUNS} execuções)")
 print("="*80)
-print(df_results)
+display(df_mean)
 print("="*80 + "\n")
 
 # ======================================================================
-# 5. GRÁFICOS COMPARATIVOS
+# 5. GRÁFICOS COMPARATIVOS (COM MÉDIAS)
 # ======================================================================
-print("--- 5/5: Gerando Gráficos Comparativos ---")
+print("--- 5/6: Gerando Gráficos Comparativos (usando Médias) ---")
+
+# Reconstrói a estrutura 'results_curves' a partir do DataFrame de médias
+results_curves_mean = {}
+model_names = ['RF (Self-Training)', 'GBR (Self-Training)', 'KNN (Self-Training)', 'Teto (KNN Supervisionado)']
+for name in model_names:
+    results_curves_mean[name] = {
+        'R2': df_mean[f'{name} R²'].values,
+        'RMSE': df_mean[f'{name} RMSE'].values
+    }
+
 plot_percentages = [p * 100 for p in label_percentages]
 colors = {
     'RF (Self-Training)': 'blue',
     'GBR (Self-Training)': 'orange',
     'KNN (Self-Training)': 'purple',
-    'Teto (RF Supervisionado)': 'black'
+    'Teto (KNN Supervisionado)': 'black'
 }
 
 plt.style.use('seaborn-v0_8-whitegrid')
 
-# Gráfico de R²
-fig, ax1 = plt.subplots(figsize=(14, 7))
-for name, res in results_curves.items():
+# Gráfico de R² (Média)
+fig, ax1 = plt.subplots(figsize=(10, 7))
+for name, res in results_curves_mean.items():
     valid_indices = ~np.isnan(res['R2'])
     x_plot = np.array(plot_percentages)[valid_indices]
     y_plot = np.array(res['R2'])[valid_indices]
     linestyle, marker, linewidth = ('--', 's', 2.5) if 'Teto' in name else ('-', 'o', 2)
     ax1.plot(x_plot, y_plot, marker=marker, linestyle=linestyle,
-             label=name, color=colors[name], linewidth=linewidth)
+             label=f"{name}", color=colors[name], linewidth=linewidth)
 
-ax1.set_title('R² vs. Porcentagem de Amostras Rotuladas (Vb)', fontsize=16, weight='bold')
-ax1.set_xlabel('Porcentagem de Medições de Desgaste (Vb) Disponíveis no Treinamento (%)', fontsize=12)
-ax1.set_ylabel('Coeficiente de Determinação (R²)', fontsize=12)
-ax1.legend(fontsize=11)
+
+ax1.set_xlabel('Porcentagem de Medições de Desgaste (Vb) Disponíveis no Treinamento (%)', fontsize=18)
+ax1.set_ylabel('Coeficiente de Determinação (R²)', fontsize=18)
+ax1.legend(fontsize=16)
 ax1.grid(True, which='both', linestyle='--', linewidth=0.5)
 ax1.set_ylim(bottom=min(0, ax1.get_ylim()[0]))
 plt.tight_layout()
 plt.show()
 
-# Gráfico de RMSE
-fig, ax2 = plt.subplots(figsize=(14, 7))
-for name, res in results_curves.items():
+# Gráfico de RMSE (Média)
+fig, ax2 = plt.subplots(figsize=(10, 7))
+for name, res in results_curves_mean.items():
     valid_indices = ~np.isnan(res['RMSE'])
     x_plot = np.array(plot_percentages)[valid_indices]
     y_plot = np.array(res['RMSE'])[valid_indices]
     linestyle, marker, linewidth = ('--', 's', 2.5) if 'Teto' in name else ('-', 'o', 2)
     ax2.plot(x_plot, y_plot, marker=marker, linestyle=linestyle,
-             label=name, color=colors[name], linewidth=linewidth)
+             label=f"{name}", color=colors[name], linewidth=linewidth)
 
-ax2.set_title('RMSE vs. Porcentagem de Amostras Rotuladas (Vb)', fontsize=16, weight='bold')
-ax2.set_xlabel('Porcentagem de Medições de Desgaste (Vb) Disponíveis no Treinamento (%)', fontsize=12)
-ax2.set_ylabel('Raiz do Erro Quadrático Médio (RMSE)', fontsize=12)
-ax2.legend(fontsize=11)
+
+ax2.set_xlabel('Porcentagem de Medições de Desgaste (Vb) Disponíveis no Treinamento (%)', fontsize=18)
+ax2.set_ylabel('Raiz do Erro Quadrático Médio (RMSE)', fontsize=18)
+ax2.legend(fontsize=16)
 ax2.grid(True, which='both', linestyle='--', linewidth=0.5)
 plt.tight_layout()
 plt.show()
+
+# ======================================================================
+# 6. GRÁFICOS DE DISPERSÃO (Casos de 20% com Erro Colorido - REFERÊNCIA TETO CONSOLIDADA)
+# ======================================================================
+print("--- 6/6: Gerando Gráficos de Dispersão (20% Rótulos com Erro Colorido) ---")
+
+# --- PASSO 1: OBTÉM O RMSE DE REFERÊNCIA DO TETO DA TABELA DE MÉDIAS (Etapa 4) ---
+try:
+    rmse_teto_medio = df_mean.loc['100%', f'{TETO_MODEL_NAME} RMSE']
+except KeyError:
+    print("AVISO: Não foi possível obter o RMSE médio do Teto (KNN) da tabela de médias (df_mean).")
+    print("Usando o RMSE da última execução como fallback.")
+    rmse_teto_medio = last_run_predictions.get('RMSE_TETO_LAST_RUN', 1.0) # Fallback
+
+if not np.isfinite(rmse_teto_medio):
+     print("ERRO: RMSE de Referência do Teto inválido ou não calculado. Usando 1.0 como fallback.")
+     rmse_teto_medio = 1.0
+
+print(f"\nRMSE de Referência Consolidado (Tabela Média 100%): {rmse_teto_medio:.4f}")
+
+def plot_scatter_color_error(ax, y_true, y_pred, title, rmse_ref):
+    """
+    Função auxiliar para plotar gráfico de dispersão com cores
+    baseadas no erro relativo ao RMSE DE REFERÊNCIA (Teto Consolidado).
+    Agora, exibe APENAS o RMSE de Referência na legenda.
+    """
+    # 1. Trata casos onde a predição falhou
+    if not isinstance(y_pred, np.ndarray) or not np.isfinite(rmse_ref):
+        ax.text(0.5, 0.5, 'Predições não disponíveis\nou Referência Inválida',
+                ha='center', va='center', transform=ax.transAxes,
+                fontsize=14, color='red')
+        ax.set_title(title, fontsize=16, weight='bold')
+        return None, np.nan # Retorna None para contagens e nan para rmse
+
+    # 2. Calcula RMSE local (apenas para retornar, não para colorir)
+    rmse_local = calculate_rmse(y_true, y_pred)
+    abs_errors = np.abs(y_true - y_pred)
+
+    # 3. Define as cores com base nos limiares de erro E CONTA, USANDO RMSE_REF
+    colors = []
+    counts = {'green': 0, 'yellow': 0, 'orange': 0, 'red': 0}
+
+    # Define os limiares USANDO O VALOR DE REFERÊNCIA (Teto)
+    thresh_green = 0.5 * rmse_ref
+    thresh_yellow = 1.0 * rmse_ref
+    thresh_orange = 2.0 * rmse_ref
+
+    for err in abs_errors:
+        if err <= thresh_green:
+            colors.append('green')
+            counts['green'] += 1
+        elif err <= thresh_yellow:
+            colors.append('yellow')
+            counts['yellow'] += 1
+        elif err <= thresh_orange:
+            colors.append('orange')
+            counts['orange'] += 1
+        else:
+            colors.append('red')
+            counts['red'] += 1
+
+    # 4. Plota o scatter plot com as cores
+    ax.scatter(y_true, y_pred, c=colors, alpha=0.7, s=10, edgecolor='k', linewidth=0.1)
+
+    # 5. Linha de referência 1:1
+    min_val = min(y_true.min(), y_pred.min()) * 0.9
+    max_val = max(y_true.max(), y_pred.max()) * 1.1
+    ax.plot([min_val, max_val], [min_val, max_val], 'r--', linewidth=2, label='Previsão Perfeita')
+
+    ax.set_xlabel('Valor Real (Vb)', fontsize=16)
+    ax.set_ylabel('Valor Previsto (Vb)', fontsize=16)
+    ax.set_title(title, fontsize=16, weight='bold')
+    ax.grid(True, linestyle='--', linewidth=0.5)
+    ax.set_aspect('equal', 'box')
+    ax.set_xlim(min_val, max_val)
+    ax.set_ylim(min_val, max_val)
+
+    # 6. Cria legenda customizada: MOSTRA APENAS O RMSE DE REFERÊNCIA
+
+    # Detalhes dos limiares
+    err_05_str = f"<= {thresh_green:.2f}"
+    err_10_str = f"<= {thresh_yellow:.2f}"
+    err_20_str = f"<= {thresh_orange:.2f}"
+    err_max_str = f"> {thresh_orange:.2f}"
+
+    # Título da legenda, agora exibindo APENAS o Teto de Referência
+    rmse_title_str = f"RMSE Teto: {rmse_ref:.4f}"
+
+    legend_elements = [
+        plt.Line2D([0], [0], marker='o', color='w', label=f'{err_05_str}', markerfacecolor='green', markersize=8),
+        plt.Line2D([0], [0], marker='o', color='w', label=f'{err_10_str}', markerfacecolor='yellow', markersize=8),
+        plt.Line2D([0], [0], marker='o', color='w', label=f'{err_20_str}', markerfacecolor='orange', markersize=8),
+        plt.Line2D([0], [0], marker='o', color='w', label=f'{err_max_str}', markerfacecolor='red', markersize=8)
+    ]
+    ax.legend(handles=legend_elements, title=rmse_title_str, loc='best', fontsize=12)
+
+    return counts, rmse_local # Retorna as contagens e o RMSE local
+
+# Define a porcentagem de interesse
+pct_20 = 0.20
+pct_20_str = f"{int(pct_20*100)}% Rótulos"
+
+# Pega as predições salvas da ÚLTIMA execução para 20%
+y_pred_teto = last_run_predictions[TETO_MODEL_NAME]
+y_pred_rf_ssl = last_run_predictions['RF (Self-Training)'].get(pct_20)
+y_pred_gbr_ssl = last_run_predictions['GBR (Self-Training)'].get(pct_20)
+y_pred_knn_ssl = last_run_predictions['KNN (Self-Training)'].get(pct_20)
+
+# Cria a figura com 4 subplots (2x2)
+fig, axes = plt.subplots(2, 2, figsize=(16, 16))
+
+# --- NOVO: Coleta de dados para a tabela ---
+tabela_contagem_data = []
+model_names_tabela = []
+
+# Plot 1: Teto (KNN Supervisionado) - PASSA O RMSE_TETO_MEDIO
+counts, rmse = plot_scatter_color_error(axes[0, 0], last_run_y_test, y_pred_teto, 'KNN Supervisionado (Teto)', rmse_teto_medio)
+tabela_contagem_data.append(counts)
+model_names_tabela.append('KNN Teto (100%)')
+
+# Plot 2: RF SSL (20% Rótulos) - PASSA O RMSE_TETO_MEDIO
+counts, rmse = plot_scatter_color_error(axes[0, 1], last_run_y_test, y_pred_rf_ssl, f'RF SSL ({pct_20_str})', rmse_teto_medio)
+tabela_contagem_data.append(counts)
+model_names_tabela.append(f'RF SSL ({pct_20_str})')
+
+# Plot 3: GBR SSL (20% Rótulos) - PASSA O RMSE_TETO_MEDIO
+counts, rmse = plot_scatter_color_error(axes[1, 0], last_run_y_test, y_pred_gbr_ssl, f'GBR SSL ({pct_20_str})', rmse_teto_medio)
+tabela_contagem_data.append(counts)
+model_names_tabela.append(f'GBR SSL ({pct_20_str})')
+
+# Plot 4: KNN SSL (20% Rótulos) - PASSA O RMSE_TETO_MEDIO
+counts, rmse = plot_scatter_color_error(axes[1, 1], last_run_y_test, y_pred_knn_ssl, f'KNN SSL ({pct_20_str})', rmse_teto_medio)
+tabela_contagem_data.append(counts)
+model_names_tabela.append(f'KNN SSL ({pct_20_str})')
+
+# --- NOVO: Cria e imprime a tabela de contagem ---
+print("\n" + "="*80)
+print(f"Tabela de Contagem de Pontos por Nível de Erro (Baseado no RMSE Teto Médio: {rmse_teto_medio:.4f})")
+print("="*80)
+
+# Remove entradas 'None' caso algum gráfico tenha falhado (ex: KNN)
+valid_data = [d for d in tabela_contagem_data if d is not None]
+valid_names = [model_names_tabela[i] for i, d in enumerate(tabela_contagem_data) if d is not None]
+
+if valid_data:
+    df_counts = pd.DataFrame(valid_data, index=valid_names)
+    df_counts.columns = ['Erro Baixo (Verde)', 'Erro Médio (Amarelo)', 'Erro Alto (Laranja)', 'Erro Extremo (Vermelho)']
+
+    # Adiciona uma coluna Total
+    df_counts['Total de Pontos'] = df_counts.sum(axis=1)
+
+    print(df_counts)
+else:
+    print("Nenhum dado de contagem válido foi gerado (possível falha em todos os gráficos).")
+print("="*80 + "\n")
+
+
+plt.tight_layout(rect=[0, 0.03, 1, 0.95]) # Ajusta para o super-título
+plt.show()
+
+print("\n--- Simulação Completa Concluída ---")
